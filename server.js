@@ -20,6 +20,13 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json());
 
+// Add keep-alive and proper headers
+app.use((req, res, next) => {
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Keep-Alive', 'timeout=5, max=100');
+  next();
+});
+
 // Logging
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.path}`);
@@ -50,9 +57,79 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Diagnostic endpoint for testing full MCP flow
+app.get('/test', async (req, res) => {
+  const tests = [];
+  
+  // Test 1: Initialize
+  try {
+    const initResponse = await testMcpRequest({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {}
+    });
+    tests.push({ test: 'initialize', status: 'passed', response: initResponse });
+  } catch (error) {
+    tests.push({ test: 'initialize', status: 'failed', error: error.message });
+  }
+  
+  // Test 2: Tools list
+  try {
+    const toolsResponse = await testMcpRequest({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/list',
+      params: {}
+    });
+    tests.push({ test: 'tools/list', status: 'passed', response: toolsResponse });
+  } catch (error) {
+    tests.push({ test: 'tools/list', status: 'failed', error: error.message });
+  }
+  
+  res.json({
+    status: 'diagnostics',
+    timestamp: new Date().toISOString(),
+    tests: tests
+  });
+});
+
+// Helper for diagnostic tests
+async function testMcpRequest(request) {
+  // Simulate internal MCP request handling
+  return new Promise((resolve) => {
+    if (request.method === 'initialize') {
+      resolve({
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'duckduckgo-search-mcp', version: '1.0.0' }
+      });
+    } else if (request.method === 'tools/list') {
+      resolve({
+        tools: [{
+          name: 'search_web',
+          description: 'Search the web using DuckDuckGo',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'Search query' },
+              max_results: { type: 'number', default: 5 }
+            },
+            required: ['query']
+          }
+        }]
+      });
+    }
+  });
+}
+
 // Main MCP endpoint
 app.post('/mcp', async (req, res) => {
   const startTime = Date.now();
+  
+  // Set timeout for the response
+  req.setTimeout(30000); // 30 seconds
+  res.setTimeout(30000);
   
   try {
     const request = req.body;
@@ -72,14 +149,17 @@ app.post('/mcp', async (req, res) => {
       });
     }
 
-    // Handle notifications
-    if (!request.id && request.method === 'notifications/initialized') {
-      console.log('Initialized notification received');
-      return res.status(204).end();
-    }
-
+    // Handle notifications (no response needed)
     if (!request.id) {
       console.log('Notification received:', request.method);
+      
+      // Specific handling for common notifications
+      if (request.method === 'notifications/initialized') {
+        console.log('Client initialized successfully');
+      } else if (request.method === 'notifications/cancelled') {
+        console.log('Request cancelled by client');
+      }
+      
       return res.status(204).end();
     }
 
@@ -177,9 +257,15 @@ app.post('/mcp', async (req, res) => {
     console.error('=== ERROR ===');
     console.error(error);
     
+    // Ensure we don't send if headers already sent
+    if (res.headersSent) {
+      console.error('Headers already sent, cannot send error response');
+      return;
+    }
+    
     const errorResponse = {
       jsonrpc: '2.0',
-      id: req.body.id || null,
+      id: req.body?.id || null,
       error: {
         code: error.code || -32603,
         message: error.message || 'Internal error',
@@ -187,6 +273,9 @@ app.post('/mcp', async (req, res) => {
       }
     };
     
+    console.log('Error response:', JSON.stringify(errorResponse, null, 2));
+    
+    // Always return 200 for JSON-RPC errors (not HTTP errors)
     res.status(200).json(errorResponse);
   }
 });
